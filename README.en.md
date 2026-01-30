@@ -563,6 +563,6 @@ This package is provided "as is", without warranty of any kind, express or impli
 
 ## License
 
-This project is licensed under the [GNU General Public License v3.0](LICENSE) (GPL-3.0).
+This project is licensed under the [MIT License](LICENSE).
 
-You are free to use, modify and redistribute this code, as long as derivative works are also published under GPL-3.0. See [LICENSE](LICENSE) for the full license text.
+You are free to use, copy, modify, fork and redistribute this code — including for commercial purposes. The only requirement is that the copyright notice is preserved. See [LICENSE](LICENSE) for the full license text.
