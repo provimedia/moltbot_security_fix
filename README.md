@@ -1,5 +1,7 @@
 # Moltbot Security Fix Package
 
+> **For the English version of this document, see [README.en.md](README.en.md).**
+
 Dieses Paket behebt 6 Sicherheitsprobleme im Moltbot Agent Security Layer.
 
 ## Wie funktioniert der Security Guard?
@@ -501,7 +503,9 @@ So verteilst du den Fix als offizielles macOS-App-Update:
 ## Was ist im Paket enthalten?
 
 ```
-README.md                                      # Diese Anleitung
+README.md                                      # Diese Anleitung (Deutsch)
+README.en.md                                   # Anleitung (Englisch)
+LICENSE                                        # GPL-3.0 Lizenz
 install.sh                                     # Installiert TypeScript-Quellen
 uninstall.sh                                   # Stellt TypeScript-Originale wieder her
 patch-dist.sh                                  # Patcht kompilierte JS-Dateien
@@ -544,3 +548,21 @@ pnpm vitest run \
 ```
 
 Alle 84 Tests müssen bestehen (0 Failures).
+
+---
+
+## Haftungsausschluss
+
+**Die Installation und Nutzung dieses Pakets erfolgt auf eigene Gefahr.**
+
+Die Autoren übernehmen keine Haftung für Schäden, Datenverlust oder Ausfälle die durch die Installation, Nutzung oder Deinstallation dieses Pakets entstehen. Es wird empfohlen vor der Installation ein vollständiges Backup der betroffenen Dateien zu erstellen. Die mitgelieferten Install-Scripts erstellen automatisch `.bak`-Backups, diese ersetzen jedoch kein vollständiges System-Backup.
+
+Dieses Paket wird bereitgestellt "wie es ist" ("as is"), ohne ausdrückliche oder stillschweigende Garantien jeglicher Art.
+
+---
+
+## Lizenz
+
+Dieses Projekt steht unter der [GNU General Public License v3.0](LICENSE) (GPL-3.0).
+
+Du darfst diesen Code frei verwenden, verändern und weitergeben, solange abgeleitete Werke ebenfalls unter der GPL-3.0 veröffentlicht werden. Siehe [LICENSE](LICENSE) für den vollständigen Lizenztext.
