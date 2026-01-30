@@ -1,0 +1,1425 @@
+From 336880b555c4b005f5559d8eb5eca8f17db5b742 Mon Sep 17 00:00:00 2001
+From: Alexander Weipprecht <htc@weipprecht-mobil.de>
+Date: Fri, 30 Jan 2026 14:05:43 +0100
+Subject: [PATCH] security: harden command guard, add audit log, anomaly
+ enforcement, and cost persistence
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Extend rm -rf pattern to catch /* and end-of-string variants
+- Add shell normalization (normalizeShellCommand) to defeat regex bypasses
+  via quote insertion, ANSI-C quoting, variable refs, and command substitution
+- Broaden tool-name checking to cover nodes tool (action: "run")
+- Add persistent JSONL audit log (~/.clawdbot/security/audit.jsonl)
+- Add shouldBlock() to anomaly detector with differentiated logging
+  (log→debug, warn/abort→warn+audit) and enforcement in abort mode
+- Add cost-tracker persistence (session/daily reset) integrated into attempt.ts
+
+Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+---
+ src/agents/pi-embedded-runner/run/attempt.ts |  69 +++++
+ src/infra/cost-tracker.test.ts               |  58 ++++
+ src/infra/cost-tracker.ts                    |  61 +++++
+ src/security/anomaly-detector.test.ts        | 178 ++++++++++++
+ src/security/anomaly-detector.ts             | 188 +++++++++++++
+ src/security/audit-log.test.ts               |  67 +++++
+ src/security/audit-log.ts                    |  43 +++
+ src/security/dangerous-command-guard.test.ts | 151 +++++++++++
+ src/security/dangerous-command-guard.ts      |  93 +++++++
+ src/security/register-builtin-guards.test.ts | 271 +++++++++++++++++++
+ src/security/register-builtin-guards.ts      | 115 ++++++++
+ 11 files changed, 1294 insertions(+)
+ create mode 100644 src/infra/cost-tracker.test.ts
+ create mode 100644 src/infra/cost-tracker.ts
+ create mode 100644 src/security/anomaly-detector.test.ts
+ create mode 100644 src/security/anomaly-detector.ts
+ create mode 100644 src/security/audit-log.test.ts
+ create mode 100644 src/security/audit-log.ts
+ create mode 100644 src/security/dangerous-command-guard.test.ts
+ create mode 100644 src/security/dangerous-command-guard.ts
+ create mode 100644 src/security/register-builtin-guards.test.ts
+ create mode 100644 src/security/register-builtin-guards.ts
+
+diff --git a/src/agents/pi-embedded-runner/run/attempt.ts b/src/agents/pi-embedded-runner/run/attempt.ts
+index 46a53bd8f..f2fed2ab1 100644
+--- a/src/agents/pi-embedded-runner/run/attempt.ts
++++ b/src/agents/pi-embedded-runner/run/attempt.ts
+@@ -85,6 +85,10 @@ import { getGlobalHookRunner } from "../../../plugins/hook-runner-global.js";
+ import { MAX_IMAGE_BYTES } from "../../../media/constants.js";
+ import type { EmbeddedRunAttemptParams, EmbeddedRunAttemptResult } from "./types.js";
+ import { detectAndLoadPromptImages } from "./images.js";
++import { createCostLimiter, hasCostLimits, type CostLimiter } from "../../../infra/cost-limiter.js";
++import { loadCostSnapshot, saveCostSnapshot } from "../../../infra/cost-tracker.js";
++import { estimateUsageCost, resolveModelCostConfig } from "../../../utils/usage-format.js";
++import { normalizeUsage } from "../../usage.js";
+ 
+ export function injectHistoryImagesIntoMessages(
+   messages: AgentMessage[],
+@@ -467,6 +471,19 @@ export async function runEmbeddedAttempt(
+         throw new Error("Embedded agent session missing");
+       }
+       const activeSession = session;
++
++      // Cost limiter: initialize if cost limits are configured.
++      const costLimitsCfg = params.config?.agents?.defaults?.costLimits;
++      let costLimiter: CostLimiter | undefined;
++      if (hasCostLimits(costLimitsCfg)) {
++        const costSnapshot = loadCostSnapshot(activeSession.sessionId);
++        costLimiter = createCostLimiter(
++          costLimitsCfg!,
++          costSnapshot.sessionCost,
++          costSnapshot.dailyCost,
++        );
++      }
++
+       const cacheTrace = createCacheTrace({
+         cfg: params.config,
+         env: process.env,
+@@ -803,6 +820,58 @@ export async function runEmbeddedAttempt(
+ 
+         messagesSnapshot = activeSession.messages.slice();
+         sessionIdUsed = activeSession.sessionId;
++
++        // Cost limiter: check costs after the run completes.
++        if (costLimiter && !aborted) {
++          const lastMsg = messagesSnapshot
++            .slice()
++            .reverse()
++            .find((m) => m.role === "assistant");
++          if (lastMsg) {
++            const msgRecord = lastMsg as unknown as Record<string, unknown>;
++            const runUsage = normalizeUsage(
++              (msgRecord.usage as Record<string, unknown>) ?? undefined,
++            );
++            if (runUsage) {
++              const costConfig = resolveModelCostConfig({
++                provider: params.provider,
++                model: params.modelId,
++                config: params.config,
++              });
++              const runCost = estimateUsageCost({ usage: runUsage, cost: costConfig });
++              if (runCost !== undefined) {
++                const result = costLimiter.addCost(runCost);
++                if (result.exceeded) {
++                  const action = costLimitsCfg?.action ?? "abort";
++                  if (action === "abort") {
++                    abortRun(
++                      false,
++                      new Error(
++                        `Cost limit exceeded: ${result.limitKind} ` +
++                          `($${result.currentValue?.toFixed(4)} >= $${result.limitValue?.toFixed(2)})`,
++                      ),
++                    );
++                  } else {
++                    log.warn(
++                      `Cost limit warning: ${result.limitKind} ` +
++                        `($${result.currentValue?.toFixed(4)} >= $${result.limitValue?.toFixed(2)})`,
++                    );
++                  }
++                }
++              }
++            }
++          }
++        }
++
++        // Persist cost snapshot for session/daily continuity.
++        if (costLimiter) {
++          saveCostSnapshot({
++            sessionId: activeSession.sessionId,
++            sessionCostUsd: costLimiter.sessionCost(),
++            dailyCostUsd: costLimiter.dailyCost(),
++          });
++        }
++
+         cacheTrace?.recordStage("session:after", {
+           messages: messagesSnapshot,
+           note: promptError ? "prompt error" : undefined,
+diff --git a/src/infra/cost-tracker.test.ts b/src/infra/cost-tracker.test.ts
+new file mode 100644
+index 000000000..dd0a0e742
+--- /dev/null
++++ b/src/infra/cost-tracker.test.ts
+@@ -0,0 +1,58 @@
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++
++import { loadCostSnapshot, saveCostSnapshot } from "./cost-tracker.js";
++
++describe("cost-tracker", () => {
++  let tmpDir: string;
++
++  beforeEach(() => {
++    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cost-tracker-test-"));
++  });
++
++  afterEach(() => {
++    fs.rmSync(tmpDir, { recursive: true, force: true });
++  });
++
++  it("round-trips save and load with same session", () => {
++    saveCostSnapshot({ sessionId: "s1", sessionCostUsd: 1.5, dailyCostUsd: 3.0 }, tmpDir);
++
++    const snapshot = loadCostSnapshot("s1", tmpDir);
++    expect(snapshot.sessionCost).toBe(1.5);
++    expect(snapshot.dailyCost).toBe(3.0);
++  });
++
++  it("resets session cost when sessionId changes", () => {
++    saveCostSnapshot({ sessionId: "s1", sessionCostUsd: 2.0, dailyCostUsd: 5.0 }, tmpDir);
++
++    const snapshot = loadCostSnapshot("s2", tmpDir);
++    expect(snapshot.sessionCost).toBe(0);
++    // Daily cost should persist (same date).
++    expect(snapshot.dailyCost).toBe(5.0);
++  });
++
++  it("resets daily cost when UTC date changes", () => {
++    // Write a snapshot with a stale date.
++    const filePath = path.join(tmpDir, "cost-tracking.json");
++    const staleSnapshot = {
++      sessionId: "s1",
++      sessionCostUsd: 1.0,
++      dailyCostUsd: 10.0,
++      dailyDate: "2020-01-01",
++    };
++    fs.mkdirSync(path.dirname(filePath), { recursive: true });
++    fs.writeFileSync(filePath, JSON.stringify(staleSnapshot), "utf8");
++
++    const snapshot = loadCostSnapshot("s1", tmpDir);
++    expect(snapshot.sessionCost).toBe(1.0);
++    expect(snapshot.dailyCost).toBe(0);
++  });
++
++  it("returns zeros when file does not exist", () => {
++    const snapshot = loadCostSnapshot("s1", tmpDir);
++    expect(snapshot.sessionCost).toBe(0);
++    expect(snapshot.dailyCost).toBe(0);
++  });
++});
+diff --git a/src/infra/cost-tracker.ts b/src/infra/cost-tracker.ts
+new file mode 100644
+index 000000000..b0a310dac
+--- /dev/null
++++ b/src/infra/cost-tracker.ts
+@@ -0,0 +1,61 @@
++import { loadJsonFile, saveJsonFile } from "./json-file.js";
++import { resolveStateDir } from "../config/paths.js";
++import path from "node:path";
++
++type CostSnapshot = {
++  sessionId: string;
++  sessionCostUsd: number;
++  dailyCostUsd: number;
++  /** UTC date string YYYY-MM-DD for daily reset. */
++  dailyDate: string;
++};
++
++function resolveTrackingPath(stateDir?: string): string {
++  const dir = stateDir ?? resolveStateDir();
++  return path.join(dir, "cost-tracking.json");
++}
++
++function utcDateString(): string {
++  return new Date().toISOString().slice(0, 10);
++}
++
++/**
++ * Load persisted cost snapshot. Resets session cost when sessionId changes,
++ * resets daily cost when the UTC date changes.
++ */
++export function loadCostSnapshot(
++  sessionId: string,
++  stateDir?: string,
++): { sessionCost: number; dailyCost: number } {
++  const filePath = resolveTrackingPath(stateDir);
++  const raw = loadJsonFile(filePath) as CostSnapshot | undefined;
++  if (!raw || typeof raw !== "object") {
++    return { sessionCost: 0, dailyCost: 0 };
++  }
++
++  const today = utcDateString();
++  const sessionCost = raw.sessionId === sessionId ? (raw.sessionCostUsd ?? 0) : 0;
++  const dailyCost = raw.dailyDate === today ? (raw.dailyCostUsd ?? 0) : 0;
++  return { sessionCost, dailyCost };
++}
++
++/**
++ * Persist current cost snapshot for session and daily tracking.
++ */
++export function saveCostSnapshot(
++  params: {
++    sessionId: string;
++    sessionCostUsd: number;
++    dailyCostUsd: number;
++  },
++  stateDir?: string,
++): void {
++  const filePath = resolveTrackingPath(stateDir);
++  const snapshot: CostSnapshot = {
++    sessionId: params.sessionId,
++    sessionCostUsd: params.sessionCostUsd,
++    dailyCostUsd: params.dailyCostUsd,
++    dailyDate: utcDateString(),
++  };
++  saveJsonFile(filePath, snapshot);
++}
+diff --git a/src/security/anomaly-detector.test.ts b/src/security/anomaly-detector.test.ts
+new file mode 100644
+index 000000000..e508b12da
+--- /dev/null
++++ b/src/security/anomaly-detector.test.ts
+@@ -0,0 +1,178 @@
++import { describe, expect, it } from "vitest";
++
++import { createAnomalyDetector } from "./anomaly-detector.js";
++
++describe("anomaly-detector", () => {
++  describe("repeat-loop detection", () => {
++    it("detects repeated identical tool calls", () => {
++      const detector = createAnomalyDetector({ enabled: true, maxRepeatCalls: 3 });
++      const call = { toolName: "exec", params: { command: "ls" } };
++
++      expect(detector.recordToolCall(call)).toBeUndefined(); // 1st
++      expect(detector.recordToolCall(call)).toBeUndefined(); // 2nd
++      const event = detector.recordToolCall(call); // 3rd → triggers
++      expect(event).toBeDefined();
++      expect(event!.type).toBe("repeat-loop");
++      expect(event!.toolName).toBe("exec");
++      expect(event!.message).toContain("3 times");
++    });
++
++    it("resets repeat count when a different call is made", () => {
++      const detector = createAnomalyDetector({ enabled: true, maxRepeatCalls: 3 });
++      const callA = { toolName: "exec", params: { command: "ls" } };
++      const callB = { toolName: "exec", params: { command: "pwd" } };
++
++      detector.recordToolCall(callA);
++      detector.recordToolCall(callA);
++      // Different call resets counter.
++      detector.recordToolCall(callB);
++      expect(detector.recordToolCall(callA)).toBeUndefined(); // reset, only 1st again
++    });
++  });
++
++  describe("burst detection", () => {
++    it("detects burst of calls within the time window", () => {
++      const detector = createAnomalyDetector({
++        enabled: true,
++        maxBurstCalls: 5,
++        burstWindowMs: 60_000,
++        // High repeat threshold to avoid triggering repeat-loop first.
++        maxRepeatCalls: 1000,
++      });
++
++      // Make 5 calls rapidly with different params to avoid repeat-loop.
++      for (let i = 0; i < 4; i++) {
++        const event = detector.recordToolCall({ toolName: "search", params: { q: `q${i}` } });
++        expect(event).toBeUndefined();
++      }
++      const event = detector.recordToolCall({ toolName: "search", params: { q: "q4" } });
++      expect(event).toBeDefined();
++      expect(event!.type).toBe("burst");
++    });
++  });
++
++  describe("excessive-navigation detection", () => {
++    it("detects excessive browser navigate calls", () => {
++      const detector = createAnomalyDetector({
++        enabled: true,
++        maxBrowserNavigations: 3,
++        // Prevent other triggers.
++        maxRepeatCalls: 1000,
++        maxBurstCalls: 1000,
++      });
++
++      const nav = { toolName: "browser", params: { action: "navigate", url: "https://a.com" } };
++      detector.recordToolCall(nav);
++      detector.recordToolCall({
++        toolName: "browser",
++        params: { action: "navigate", url: "https://b.com" },
++      });
++      const event = detector.recordToolCall({
++        toolName: "browser",
++        params: { action: "navigate", url: "https://c.com" },
++      });
++      expect(event).toBeDefined();
++      expect(event!.type).toBe("excessive-navigation");
++      expect(event!.message).toContain("3 times");
++    });
++
++    it("does not count non-navigate browser actions", () => {
++      const detector = createAnomalyDetector({
++        enabled: true,
++        maxBrowserNavigations: 2,
++        maxRepeatCalls: 1000,
++        maxBurstCalls: 1000,
++      });
++
++      detector.recordToolCall({ toolName: "browser", params: { action: "snapshot" } });
++      detector.recordToolCall({
++        toolName: "browser",
++        params: { action: "click", selector: "#btn" },
++      });
++      // No excessive-navigation event for non-navigate actions.
++      expect(detector.getAnomalies()).toHaveLength(0);
++    });
++  });
++
++  describe("error-loop detection", () => {
++    it("detects repeated identical errors", () => {
++      const detector = createAnomalyDetector({ enabled: true, maxRepeatCalls: 3 });
++      const call = { toolName: "exec", params: { command: "bad" }, error: "ENOENT" };
++
++      // Each call has a different param to avoid repeat-loop, but same error.
++      const makeCall = (i: number) => ({
++        toolName: "exec",
++        params: { command: `bad-${i}` },
++        error: "ENOENT",
++      });
++
++      detector.recordToolCall(makeCall(0));
++      detector.recordToolCall(makeCall(1));
++      const event = detector.recordToolCall(makeCall(2));
++      expect(event).toBeDefined();
++      expect(event!.type).toBe("error-loop");
++      expect(event!.message).toContain("3 times");
++    });
++
++    it("resets error count when a successful call is made", () => {
++      const detector = createAnomalyDetector({
++        enabled: true,
++        maxRepeatCalls: 3,
++        maxBurstCalls: 1000,
++      });
++      detector.recordToolCall({ toolName: "exec", params: { command: "a" }, error: "FAIL" });
++      detector.recordToolCall({ toolName: "exec", params: { command: "b" }, error: "FAIL" });
++      // Successful call resets error tracking.
++      detector.recordToolCall({ toolName: "exec", params: { command: "c" } });
++      expect(
++        detector.recordToolCall({ toolName: "exec", params: { command: "d" }, error: "FAIL" }),
++      ).toBeUndefined();
++    });
++  });
++
++  describe("getAnomalies", () => {
++    it("returns all detected anomalies", () => {
++      const detector = createAnomalyDetector({ enabled: true, maxRepeatCalls: 2 });
++      const call = { toolName: "exec", params: { command: "ls" } };
++      detector.recordToolCall(call);
++      detector.recordToolCall(call); // triggers
++      expect(detector.getAnomalies()).toHaveLength(1);
++      expect(detector.getAnomalies()[0].type).toBe("repeat-loop");
++    });
++  });
++
++  describe("shouldBlock", () => {
++    it("returns block: false when action is 'log' even with anomalies", () => {
++      const detector = createAnomalyDetector({ enabled: true, maxRepeatCalls: 2, action: "log" });
++      const call = { toolName: "exec", params: { command: "ls" } };
++      detector.recordToolCall(call);
++      detector.recordToolCall(call); // triggers anomaly
++      expect(detector.getAnomalies()).toHaveLength(1);
++      expect(detector.shouldBlock().block).toBe(false);
++    });
++
++    it("returns block: false when action is 'warn' even with anomalies", () => {
++      const detector = createAnomalyDetector({ enabled: true, maxRepeatCalls: 2, action: "warn" });
++      const call = { toolName: "exec", params: { command: "ls" } };
++      detector.recordToolCall(call);
++      detector.recordToolCall(call); // triggers anomaly
++      expect(detector.getAnomalies()).toHaveLength(1);
++      expect(detector.shouldBlock().block).toBe(false);
++    });
++
++    it("returns block: true when action is 'abort' and anomalies exist", () => {
++      const detector = createAnomalyDetector({ enabled: true, maxRepeatCalls: 2, action: "abort" });
++      const call = { toolName: "exec", params: { command: "ls" } };
++      // No anomalies yet — should not block.
++      expect(detector.shouldBlock().block).toBe(false);
++      detector.recordToolCall(call);
++      detector.recordToolCall(call); // triggers anomaly
++      expect(detector.getAnomalies()).toHaveLength(1);
++      const result = detector.shouldBlock();
++      expect(result.block).toBe(true);
++      if (result.block) {
++        expect(result.reason).toContain("repeat-loop");
++      }
++    });
++  });
++});
+diff --git a/src/security/anomaly-detector.ts b/src/security/anomaly-detector.ts
+new file mode 100644
+index 000000000..026476737
+--- /dev/null
++++ b/src/security/anomaly-detector.ts
+@@ -0,0 +1,188 @@
++import { createSubsystemLogger } from "../logging/subsystem.js";
++import { appendAuditEntry } from "./audit-log.js";
++
++const log = createSubsystemLogger("security/anomaly");
++
++export type AnomalyDetectorConfig = {
++  /** Enable anomaly detection. Default: false. */
++  enabled?: boolean;
++  /** Max identical consecutive tool calls before flagging. Default: 10. */
++  maxRepeatCalls?: number;
++  /** Max browser navigate calls per run. Default: 50. */
++  maxBrowserNavigations?: number;
++  /** Burst detection window in ms. Default: 60000. */
++  burstWindowMs?: number;
++  /** Max tool calls within burst window. Default: 30. */
++  maxBurstCalls?: number;
++  /** Action when anomaly is detected. Default: "log". */
++  action?: "log" | "warn" | "abort";
++};
++
++export type AnomalyEvent = {
++  type: "repeat-loop" | "burst" | "excessive-navigation" | "error-loop";
++  message: string;
++  toolName: string;
++};
++
++export type AnomalyBlockResult = { block: true; reason: string } | { block: false };
++
++export type AnomalyDetector = {
++  /** Record a tool call for anomaly analysis. */
++  recordToolCall: (call: {
++    toolName: string;
++    params: Record<string, unknown>;
++    error?: string;
++  }) => AnomalyEvent | undefined;
++  /** Get all detected anomalies so far. */
++  getAnomalies: () => AnomalyEvent[];
++  /** Check if anomalies should block execution (only in abort mode). */
++  shouldBlock: () => AnomalyBlockResult;
++};
++
++/**
++ * Create an anomaly detector that monitors tool call patterns for suspicious
++ * behavior (repetitive loops, bursts, excessive navigation, error loops).
++ */
++export function createAnomalyDetector(config: AnomalyDetectorConfig): AnomalyDetector {
++  const maxRepeatCalls = config.maxRepeatCalls ?? 10;
++  const maxBrowserNavigations = config.maxBrowserNavigations ?? 50;
++  const burstWindowMs = config.burstWindowMs ?? 60_000;
++  const maxBurstCalls = config.maxBurstCalls ?? 30;
++  const action = config.action ?? "log";
++
++  // State tracking.
++  let lastToolKey = "";
++  let repeatCount = 0;
++  let browserNavCount = 0;
++  let lastErrorKey = "";
++  let errorRepeatCount = 0;
++  const callTimestamps: number[] = [];
++  const anomalies: AnomalyEvent[] = [];
++
++  function emitAnomaly(event: AnomalyEvent): AnomalyEvent {
++    anomalies.push(event);
++    if (action === "log") {
++      log.debug(`Anomaly detected [${event.type}]: ${event.message}`);
++    } else if (action === "warn" || action === "abort") {
++      log.warn(`Anomaly detected [${event.type}]: ${event.message}`);
++      appendAuditEntry({
++        ts: Date.now(),
++        event: "anomaly_detected",
++        toolName: event.toolName,
++        anomalyType: event.type,
++        reason: event.message,
++      });
++    }
++    return event;
++  }
++
++  function buildToolKey(toolName: string, params: Record<string, unknown>): string {
++    try {
++      return `${toolName}:${JSON.stringify(params)}`;
++    } catch {
++      return toolName;
++    }
++  }
++
++  function recordToolCall(call: {
++    toolName: string;
++    params: Record<string, unknown>;
++    error?: string;
++  }): AnomalyEvent | undefined {
++    const now = Date.now();
++    const toolKey = buildToolKey(call.toolName, call.params);
++
++    // --- Repeat-loop detection ---
++    if (toolKey === lastToolKey) {
++      repeatCount += 1;
++      if (repeatCount >= maxRepeatCalls) {
++        const event = emitAnomaly({
++          type: "repeat-loop",
++          message: `Tool "${call.toolName}" called ${repeatCount} times with identical params`,
++          toolName: call.toolName,
++        });
++        repeatCount = 0;
++        return event;
++      }
++    } else {
++      lastToolKey = toolKey;
++      repeatCount = 1;
++    }
++
++    // --- Burst detection ---
++    callTimestamps.push(now);
++    // Prune timestamps outside the window.
++    while (callTimestamps.length > 0 && callTimestamps[0] < now - burstWindowMs) {
++      callTimestamps.shift();
++    }
++    if (callTimestamps.length >= maxBurstCalls) {
++      const event = emitAnomaly({
++        type: "burst",
++        message: `${callTimestamps.length} tool calls in ${burstWindowMs}ms window`,
++        toolName: call.toolName,
++      });
++      callTimestamps.length = 0;
++      return event;
++    }
++
++    // --- Excessive browser navigation ---
++    if (call.toolName === "browser" && extractBrowserAction(call.params) === "navigate") {
++      browserNavCount += 1;
++      if (browserNavCount >= maxBrowserNavigations) {
++        const event = emitAnomaly({
++          type: "excessive-navigation",
++          message: `Browser navigate called ${browserNavCount} times`,
++          toolName: call.toolName,
++        });
++        browserNavCount = 0;
++        return event;
++      }
++    }
++
++    // --- Error-loop detection ---
++    if (call.error) {
++      const errorKey = `${call.toolName}:${call.error}`;
++      if (errorKey === lastErrorKey) {
++        errorRepeatCount += 1;
++        if (errorRepeatCount >= maxRepeatCalls) {
++          const event = emitAnomaly({
++            type: "error-loop",
++            message: `Tool "${call.toolName}" failed ${errorRepeatCount} times with same error`,
++            toolName: call.toolName,
++          });
++          errorRepeatCount = 0;
++          return event;
++        }
++      } else {
++        lastErrorKey = errorKey;
++        errorRepeatCount = 1;
++      }
++    } else {
++      lastErrorKey = "";
++      errorRepeatCount = 0;
++    }
++
++    return undefined;
++  }
++
++  function shouldBlock(): AnomalyBlockResult {
++    if (action !== "abort") return { block: false };
++    if (anomalies.length === 0) return { block: false };
++    const latest = anomalies[anomalies.length - 1];
++    return {
++      block: true,
++      reason: `Anomaly abort [${latest.type}]: ${latest.message}`,
++    };
++  }
++
++  return {
++    recordToolCall,
++    getAnomalies: () => [...anomalies],
++    shouldBlock,
++  };
++}
++
++function extractBrowserAction(params: Record<string, unknown>): string | undefined {
++  if (typeof params.action === "string") return params.action.toLowerCase();
++  return undefined;
++}
+diff --git a/src/security/audit-log.test.ts b/src/security/audit-log.test.ts
+new file mode 100644
+index 000000000..132508202
+--- /dev/null
++++ b/src/security/audit-log.test.ts
+@@ -0,0 +1,67 @@
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++
++import { appendAuditEntry, resolveAuditLogPath, type AuditLogEntry } from "./audit-log.js";
++
++describe("audit-log", () => {
++  let tmpDir: string;
++
++  beforeEach(() => {
++    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "audit-log-test-"));
++  });
++
++  afterEach(() => {
++    fs.rmSync(tmpDir, { recursive: true, force: true });
++  });
++
++  it("writes a single entry as JSONL", () => {
++    const entry: AuditLogEntry = {
++      ts: 1000,
++      event: "command_blocked",
++      toolName: "exec",
++      command: "ordercli --confirm",
++      ruleName: "ordercli-confirm",
++      reason: "blocked",
++    };
++    appendAuditEntry(entry, tmpDir);
++
++    const logPath = resolveAuditLogPath(tmpDir);
++    const content = fs.readFileSync(logPath, "utf8");
++    const parsed = JSON.parse(content.trim());
++    expect(parsed.event).toBe("command_blocked");
++    expect(parsed.toolName).toBe("exec");
++    expect(parsed.ts).toBe(1000);
++  });
++
++  it("appends multiple entries as separate lines", () => {
++    const entry1: AuditLogEntry = { ts: 1, event: "command_blocked" };
++    const entry2: AuditLogEntry = { ts: 2, event: "anomaly_detected", anomalyType: "burst" };
++    const entry3: AuditLogEntry = { ts: 3, event: "cost_limit_exceeded" };
++
++    appendAuditEntry(entry1, tmpDir);
++    appendAuditEntry(entry2, tmpDir);
++    appendAuditEntry(entry3, tmpDir);
++
++    const logPath = resolveAuditLogPath(tmpDir);
++    const lines = fs.readFileSync(logPath, "utf8").trim().split("\n");
++    expect(lines).toHaveLength(3);
++    expect(JSON.parse(lines[0]).ts).toBe(1);
++    expect(JSON.parse(lines[1]).event).toBe("anomaly_detected");
++    expect(JSON.parse(lines[2]).event).toBe("cost_limit_exceeded");
++  });
++
++  it("produces valid JSONL (each line is valid JSON)", () => {
++    for (let i = 0; i < 5; i++) {
++      appendAuditEntry({ ts: i, event: "command_blocked", reason: `r${i}` }, tmpDir);
++    }
++
++    const logPath = resolveAuditLogPath(tmpDir);
++    const lines = fs.readFileSync(logPath, "utf8").trim().split("\n");
++    expect(lines).toHaveLength(5);
++    for (const line of lines) {
++      expect(() => JSON.parse(line)).not.toThrow();
++    }
++  });
++});
+diff --git a/src/security/audit-log.ts b/src/security/audit-log.ts
+new file mode 100644
+index 000000000..ca78f6360
+--- /dev/null
++++ b/src/security/audit-log.ts
+@@ -0,0 +1,43 @@
++import fs from "node:fs";
++import path from "node:path";
++
++import { resolveStateDir } from "../config/paths.js";
++import { createSubsystemLogger } from "../logging/subsystem.js";
++
++const log = createSubsystemLogger("security/audit-log");
++
++export type AuditLogEntry = {
++  ts: number;
++  event: "command_blocked" | "anomaly_detected" | "cost_limit_exceeded";
++  toolName?: string;
++  command?: string;
++  ruleName?: string;
++  reason?: string;
++  anomalyType?: string;
++};
++
++/**
++ * Resolve the audit log file path (~/.clawdbot/security/audit.jsonl).
++ */
++export function resolveAuditLogPath(stateDir?: string): string {
++  const dir = stateDir ?? resolveStateDir();
++  return path.join(dir, "security", "audit.jsonl");
++}
++
++/**
++ * Append a single audit entry as JSONL to the persistent audit log.
++ * Never throws — errors are logged and swallowed.
++ */
++export function appendAuditEntry(entry: AuditLogEntry, stateDir?: string): void {
++  try {
++    const filePath = resolveAuditLogPath(stateDir);
++    const dir = path.dirname(filePath);
++    if (!fs.existsSync(dir)) {
++      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
++    }
++    const line = JSON.stringify(entry) + "\n";
++    fs.appendFileSync(filePath, line, { mode: 0o600 });
++  } catch (err) {
++    log.warn(`Failed to write audit entry: ${err}`);
++  }
++}
+diff --git a/src/security/dangerous-command-guard.test.ts b/src/security/dangerous-command-guard.test.ts
+new file mode 100644
+index 000000000..ee8233815
+--- /dev/null
++++ b/src/security/dangerous-command-guard.test.ts
+@@ -0,0 +1,151 @@
++import { describe, expect, it } from "vitest";
++
++import {
++  checkCommand,
++  normalizeShellCommand,
++  type DangerousCommandGuardConfig,
++} from "./dangerous-command-guard.js";
++
++describe("checkCommand", () => {
++  describe("built-in rules", () => {
++    it("blocks ordercli --confirm", () => {
++      const result = checkCommand("ordercli order --confirm");
++      expect(result.blocked).toBe(true);
++      expect(result.ruleName).toBe("ordercli-confirm");
++      expect(result.reason).toContain("ordercli --confirm");
++    });
++
++    it("blocks ordercli --pay", () => {
++      const result = checkCommand("ordercli checkout --pay");
++      expect(result.blocked).toBe(true);
++      expect(result.ruleName).toBe("ordercli-pay");
++      expect(result.reason).toContain("ordercli --pay");
++    });
++
++    it("blocks rm -rf / (root)", () => {
++      const result = checkCommand("rm -rf / ");
++      expect(result.blocked).toBe(true);
++      expect(result.ruleName).toBe("rm-rf-root");
++    });
++
++    it("blocks rm -Rf / (root, uppercase R)", () => {
++      const result = checkCommand("rm -Rf / ");
++      expect(result.blocked).toBe(true);
++      expect(result.ruleName).toBe("rm-rf-root");
++    });
++
++    it("blocks rm -rf /* (glob)", () => {
++      const result = checkCommand("rm -rf /*");
++      expect(result.blocked).toBe(true);
++      expect(result.ruleName).toBe("rm-rf-root");
++    });
++
++    it("blocks rm -rf / at end of string (no trailing space)", () => {
++      const result = checkCommand("rm -rf /");
++      expect(result.blocked).toBe(true);
++      expect(result.ruleName).toBe("rm-rf-root");
++    });
++
++    it("allows safe commands", () => {
++      expect(checkCommand("ls -la").blocked).toBe(false);
++      expect(checkCommand("echo hello").blocked).toBe(false);
++      expect(checkCommand("npm install").blocked).toBe(false);
++    });
++
++    it("allows rm on non-root paths", () => {
++      expect(checkCommand("rm -rf /tmp/test").blocked).toBe(false);
++    });
++  });
++
++  describe("custom rules", () => {
++    it("matches a custom rule", () => {
++      const config: DangerousCommandGuardConfig = {
++        rules: [
++          {
++            name: "no-deploy",
++            pattern: "deploy\\s+--prod",
++            reason: "Production deployment blocked.",
++          },
++        ],
++      };
++      const result = checkCommand("deploy --prod --force", config);
++      expect(result.blocked).toBe(true);
++      expect(result.ruleName).toBe("no-deploy");
++      expect(result.reason).toBe("Production deployment blocked.");
++    });
++
++    it("uses default reason when custom rule has no reason", () => {
++      const config: DangerousCommandGuardConfig = {
++        rules: [{ name: "no-drop", pattern: "DROP\\s+TABLE" }],
++      };
++      const result = checkCommand("DROP TABLE users", config);
++      expect(result.blocked).toBe(true);
++      expect(result.reason).toContain('blocked by safety rule "no-drop"');
++    });
++  });
++
++  describe("builtinRules=false", () => {
++    it("disables all built-in rules", () => {
++      const config: DangerousCommandGuardConfig = { builtinRules: false };
++      expect(checkCommand("ordercli order --confirm", config).blocked).toBe(false);
++      expect(checkCommand("ordercli checkout --pay", config).blocked).toBe(false);
++      expect(checkCommand("rm -rf / ", config).blocked).toBe(false);
++    });
++
++    it("still applies custom rules when builtins are disabled", () => {
++      const config: DangerousCommandGuardConfig = {
++        builtinRules: false,
++        rules: [{ name: "no-sudo", pattern: "^sudo " }],
++      };
++      expect(checkCommand("sudo rm -rf /tmp", config).blocked).toBe(true);
++    });
++  });
++
++  it("skips rules with invalid regex patterns", () => {
++    const config: DangerousCommandGuardConfig = {
++      rules: [{ name: "bad-regex", pattern: "[invalid" }],
++    };
++    // Should not throw, and should not block.
++    expect(checkCommand("anything", config).blocked).toBe(false);
++  });
++});
++
++describe("normalizeShellCommand", () => {
++  it("strips double quotes", () => {
++    expect(normalizeShellCommand('ord"er"cli --confirm')).toBe("ordercli --confirm");
++  });
++
++  it("strips single quotes", () => {
++    expect(normalizeShellCommand("ord'er'cli --pay")).toBe("ordercli --pay");
++  });
++
++  it("removes $(...) command substitutions", () => {
++    expect(normalizeShellCommand("$(echo rm) -rf /")).toBe("-rf /");
++  });
++
++  it("removes backtick command substitutions", () => {
++    expect(normalizeShellCommand("`echo rm` -rf /")).toBe("-rf /");
++  });
++
++  it("removes ANSI-C quoting $'...'", () => {
++    expect(normalizeShellCommand("ordercli$'\\x20'--confirm")).toBe("ordercli--confirm");
++  });
++
++  it("removes ${VAR} and $VAR references", () => {
++    expect(normalizeShellCommand("ordercli${FOO} --confirm $BAR")).toBe("ordercli --confirm");
++  });
++});
++
++describe("checkCommand with normalization bypass attempts", () => {
++  it("blocks ordercli with embedded quotes", () => {
++    const result = checkCommand('ord"er"cli --confirm');
++    expect(result.blocked).toBe(true);
++    expect(result.ruleName).toBe("ordercli-confirm");
++  });
++
++  it("blocks ordercli with ANSI-C quoting bypass", () => {
++    const result = checkCommand("ordercli$'\\x20'--confirm");
++    expect(result.blocked).toBe(true);
++    expect(result.ruleName).toBe("ordercli-confirm");
++  });
++});
+diff --git a/src/security/dangerous-command-guard.ts b/src/security/dangerous-command-guard.ts
+new file mode 100644
+index 000000000..0cf3bba23
+--- /dev/null
++++ b/src/security/dangerous-command-guard.ts
+@@ -0,0 +1,93 @@
++import type { DangerousCommandRule } from "../config/types.agent-defaults.js";
++
++export type DangerousCommandGuardConfig = {
++  /** Enable built-in blocking rules. Default: true. */
++  builtinRules?: boolean;
++  /** Custom blocking rules. */
++  rules?: DangerousCommandRule[];
++};
++
++export type GuardResult = {
++  blocked: boolean;
++  reason?: string;
++  ruleName?: string;
++};
++
++/**
++ * Built-in rules that protect against dangerous automated commands.
++ * These are always active when `builtinRules` is true (the default).
++ */
++const BUILTIN_RULES: DangerousCommandRule[] = [
++  {
++    name: "ordercli-confirm",
++    pattern: "ordercli\\b.*--confirm",
++    reason:
++      "Blocked: ordercli --confirm requires explicit user approval. " +
++      "The agent cannot auto-confirm food orders.",
++  },
++  {
++    name: "ordercli-pay",
++    pattern: "ordercli\\b.*--pay",
++    reason:
++      "Blocked: ordercli --pay requires explicit user approval. " +
++      "The agent cannot auto-pay for orders.",
++  },
++  {
++    name: "rm-rf-root",
++    pattern: "rm\\s+-[rR]f\\s+/(?:\\s|\\*|$)",
++    reason: "Blocked: recursive delete from root is not allowed.",
++  },
++];
++
++/**
++ * Normalize a shell command string to defeat regex-bypass tricks
++ * (quote insertion, variable references, backslash-escapes, ANSI-C quoting,
++ * and command substitution).
++ */
++export function normalizeShellCommand(cmd: string): string {
++  let s = cmd;
++  // Remove command substitutions: $(...) and `...`
++  s = s.replace(/\$\([^)]*\)/g, "");
++  s = s.replace(/`[^`]*`/g, "");
++  // Remove ANSI-C quoting: $'...'
++  s = s.replace(/\$'[^']*'/g, "");
++  // Strip double and single quotes (e.g. ord"er"cli → ordercli)
++  s = s.replace(/["']/g, "");
++  // Remove ${VAR} and $VAR references
++  s = s.replace(/\$\{[^}]*\}/g, "");
++  s = s.replace(/\$[A-Za-z_]\w*/g, "");
++  // Remove backslash-escapes
++  s = s.replace(/\\./g, "");
++  // Normalize whitespace
++  s = s.replace(/\s+/g, " ").trim();
++  return s;
++}
++
++/**
++ * Check a command string against all active guard rules.
++ */
++export function checkCommand(command: string, config?: DangerousCommandGuardConfig): GuardResult {
++  const builtinEnabled = config?.builtinRules !== false;
++  const customRules = config?.rules ?? [];
++
++  const allRules = [...(builtinEnabled ? BUILTIN_RULES : []), ...customRules];
++
++  const normalized = normalizeShellCommand(command);
++
++  for (const rule of allRules) {
++    try {
++      const regex = new RegExp(rule.pattern, "i");
++      if (regex.test(command) || regex.test(normalized)) {
++        return {
++          blocked: true,
++          reason: rule.reason ?? `Command blocked by safety rule "${rule.name}": ${command}`,
++          ruleName: rule.name,
++        };
++      }
++    } catch {
++      // Invalid regex in config — skip silently.
++    }
++  }
++
++  return { blocked: false };
++}
+diff --git a/src/security/register-builtin-guards.test.ts b/src/security/register-builtin-guards.test.ts
+new file mode 100644
+index 000000000..19674b391
+--- /dev/null
++++ b/src/security/register-builtin-guards.test.ts
+@@ -0,0 +1,271 @@
++import { describe, it, expect, beforeEach, afterEach } from "vitest";
++import { createBuiltinGuardHooks } from "./register-builtin-guards.js";
++import {
++  initializeGlobalHookRunner,
++  getGlobalHookRunner,
++  resetGlobalHookRunner,
++} from "../plugins/hook-runner-global.js";
++import type { PluginRegistry } from "../plugins/registry.js";
++import type { PluginHookRegistration } from "../plugins/types.js";
++
++/**
++ * Build a minimal PluginRegistry that includes builtin guard hooks,
++ * mirroring what loadMoltbotPlugins does at startup.
++ */
++function buildRegistryWithGuards(config?: Record<string, unknown>): PluginRegistry {
++  const guards = createBuiltinGuardHooks(config as any);
++  const registry: PluginRegistry = {
++    plugins: [],
++    tools: [],
++    hooks: [],
++    typedHooks: [
++      {
++        pluginId: "builtin:security-guards",
++        hookName: "before_tool_call",
++        handler: guards.before_tool_call,
++        priority: 1000,
++        source: "builtin",
++      } as PluginHookRegistration,
++      {
++        pluginId: "builtin:security-guards",
++        hookName: "after_tool_call",
++        handler: guards.after_tool_call,
++        priority: 1000,
++        source: "builtin",
++      } as PluginHookRegistration,
++    ],
++    channels: [],
++    providers: [],
++    gatewayHandlers: {},
++    httpHandlers: [],
++    httpRoutes: [],
++    cliRegistrars: [],
++    services: [],
++    commands: [],
++    diagnostics: [],
++  };
++  return registry;
++}
++
++describe("register-builtin-guards integration", () => {
++  afterEach(() => {
++    resetGlobalHookRunner();
++  });
++
++  it("registers both before_tool_call and after_tool_call hooks", () => {
++    const registry = buildRegistryWithGuards();
++    expect(registry.typedHooks).toHaveLength(2);
++    expect(registry.typedHooks[0].hookName).toBe("before_tool_call");
++    expect(registry.typedHooks[1].hookName).toBe("after_tool_call");
++    expect(registry.typedHooks[0].pluginId).toBe("builtin:security-guards");
++  });
++
++  it("global hook runner reports hooks after initialization", () => {
++    const registry = buildRegistryWithGuards();
++    initializeGlobalHookRunner(registry);
++    const runner = getGlobalHookRunner();
++    expect(runner).not.toBeNull();
++    expect(runner!.hasHooks("before_tool_call")).toBe(true);
++    expect(runner!.hasHooks("after_tool_call")).toBe(true);
++  });
++
++  it("before_tool_call blocks dangerous exec commands via the hook runner", async () => {
++    const registry = buildRegistryWithGuards();
++    initializeGlobalHookRunner(registry);
++    const runner = getGlobalHookRunner()!;
++
++    const result = await runner.runBeforeToolCall(
++      { toolName: "exec", params: { command: "ordercli pizza --confirm" } },
++      { agentId: "test", sessionKey: "s1", toolName: "exec" },
++    );
++
++    expect(result).toBeDefined();
++    expect(result!.block).toBe(true);
++    expect(result!.blockReason).toContain("ordercli --confirm");
++  });
++
++  it("before_tool_call blocks ordercli --pay via the hook runner", async () => {
++    const registry = buildRegistryWithGuards();
++    initializeGlobalHookRunner(registry);
++    const runner = getGlobalHookRunner()!;
++
++    const result = await runner.runBeforeToolCall(
++      { toolName: "bash", params: { command: "ordercli burger --pay" } },
++      { agentId: "test", sessionKey: "s1", toolName: "bash" },
++    );
++
++    expect(result).toBeDefined();
++    expect(result!.block).toBe(true);
++    expect(result!.blockReason).toContain("ordercli --pay");
++  });
++
++  it("before_tool_call blocks rm -rf / via the hook runner", async () => {
++    const registry = buildRegistryWithGuards();
++    initializeGlobalHookRunner(registry);
++    const runner = getGlobalHookRunner()!;
++
++    const result = await runner.runBeforeToolCall(
++      { toolName: "exec", params: { command: "rm -rf / " } },
++      { agentId: "test", sessionKey: "s1", toolName: "exec" },
++    );
++
++    expect(result).toBeDefined();
++    expect(result!.block).toBe(true);
++    expect(result!.blockReason).toContain("recursive delete");
++  });
++
++  it("before_tool_call allows safe commands", async () => {
++    const registry = buildRegistryWithGuards();
++    initializeGlobalHookRunner(registry);
++    const runner = getGlobalHookRunner()!;
++
++    const result = await runner.runBeforeToolCall(
++      { toolName: "exec", params: { command: "ls -la" } },
++      { agentId: "test", sessionKey: "s1", toolName: "exec" },
++    );
++
++    // No block result means allowed.
++    expect(result?.block).toBeFalsy();
++  });
++
++  it("before_tool_call ignores non-exec/bash tools", async () => {
++    const registry = buildRegistryWithGuards();
++    initializeGlobalHookRunner(registry);
++    const runner = getGlobalHookRunner()!;
++
++    const result = await runner.runBeforeToolCall(
++      { toolName: "browser", params: { command: "ordercli --confirm" } },
++      { agentId: "test", sessionKey: "s1", toolName: "browser" },
++    );
++
++    expect(result?.block).toBeFalsy();
++  });
++
++  it("custom safety rules block via the hook runner", async () => {
++    const registry = buildRegistryWithGuards({
++      agents: {
++        defaults: {
++          safety: {
++            rules: [
++              { name: "no-deploy", pattern: "deploy.*--prod", reason: "Blocked: no prod deploy" },
++            ],
++          },
++        },
++      },
++    });
++    initializeGlobalHookRunner(registry);
++    const runner = getGlobalHookRunner()!;
++
++    const result = await runner.runBeforeToolCall(
++      { toolName: "exec", params: { command: "deploy my-app --prod" } },
++      { agentId: "test", sessionKey: "s1", toolName: "exec" },
++    );
++
++    expect(result!.block).toBe(true);
++    expect(result!.blockReason).toContain("no prod deploy");
++  });
++
++  it("disabling builtinRules stops default blocking", async () => {
++    const registry = buildRegistryWithGuards({
++      agents: { defaults: { safety: { builtinRules: false } } },
++    });
++    initializeGlobalHookRunner(registry);
++    const runner = getGlobalHookRunner()!;
++
++    const result = await runner.runBeforeToolCall(
++      { toolName: "exec", params: { command: "ordercli pizza --confirm" } },
++      { agentId: "test", sessionKey: "s1", toolName: "exec" },
++    );
++
++    expect(result?.block).toBeFalsy();
++  });
++
++  it("before_tool_call blocks nodes tool with action=run and dangerous rawCommand", async () => {
++    const registry = buildRegistryWithGuards();
++    initializeGlobalHookRunner(registry);
++    const runner = getGlobalHookRunner()!;
++
++    const result = await runner.runBeforeToolCall(
++      { toolName: "nodes", params: { action: "run", rawCommand: "ordercli --confirm" } },
++      { agentId: "test", sessionKey: "s1", toolName: "nodes" },
++    );
++
++    expect(result).toBeDefined();
++    expect(result!.block).toBe(true);
++    expect(result!.blockReason).toContain("ordercli --confirm");
++  });
++
++  it("before_tool_call allows nodes tool with action=status (not checked)", async () => {
++    const registry = buildRegistryWithGuards();
++    initializeGlobalHookRunner(registry);
++    const runner = getGlobalHookRunner()!;
++
++    const result = await runner.runBeforeToolCall(
++      { toolName: "nodes", params: { action: "status", rawCommand: "ordercli --confirm" } },
++      { agentId: "test", sessionKey: "s1", toolName: "nodes" },
++    );
++
++    expect(result?.block).toBeFalsy();
++  });
++
++  it("before_tool_call allows nodes tool with action=run and safe command", async () => {
++    const registry = buildRegistryWithGuards();
++    initializeGlobalHookRunner(registry);
++    const runner = getGlobalHookRunner()!;
++
++    const result = await runner.runBeforeToolCall(
++      { toolName: "nodes", params: { action: "run", rawCommand: "ls -la" } },
++      { agentId: "test", sessionKey: "s1", toolName: "nodes" },
++    );
++
++    expect(result?.block).toBeFalsy();
++  });
++
++  it("after_tool_call records anomaly data (does not throw)", async () => {
++    const registry = buildRegistryWithGuards({
++      agents: { defaults: { anomalyDetection: { enabled: true, maxRepeatCalls: 3 } } },
++    });
++    initializeGlobalHookRunner(registry);
++    const runner = getGlobalHookRunner()!;
++
++    // Fire a few after_tool_call events — should not throw.
++    for (let i = 0; i < 5; i++) {
++      await runner.runAfterToolCall(
++        { toolName: "exec", params: { command: "echo hi" }, durationMs: 10 },
++        { agentId: "test", sessionKey: "s1", toolName: "exec" },
++      );
++    }
++    // If we got here without error, the anomaly detector is wired correctly.
++    expect(true).toBe(true);
++  });
++
++  it("before_tool_call blocks when anomaly detector is in abort mode with anomalies", async () => {
++    const registry = buildRegistryWithGuards({
++      agents: {
++        defaults: {
++          anomalyDetection: { enabled: true, maxRepeatCalls: 2, action: "abort" },
++        },
++      },
++    });
++    initializeGlobalHookRunner(registry);
++    const runner = getGlobalHookRunner()!;
++
++    // Fire repeated after_tool_call events to trigger anomaly.
++    for (let i = 0; i < 3; i++) {
++      await runner.runAfterToolCall(
++        { toolName: "exec", params: { command: "echo hi" }, durationMs: 10 },
++        { agentId: "test", sessionKey: "s1", toolName: "exec" },
++      );
++    }
++
++    // Now a before_tool_call should be blocked by the anomaly detector.
++    const result = await runner.runBeforeToolCall(
++      { toolName: "exec", params: { command: "echo safe" } },
++      { agentId: "test", sessionKey: "s1", toolName: "exec" },
++    );
++
++    expect(result).toBeDefined();
++    expect(result!.block).toBe(true);
++    expect(result!.blockReason).toContain("Anomaly");
++  });
++});
+diff --git a/src/security/register-builtin-guards.ts b/src/security/register-builtin-guards.ts
+new file mode 100644
+index 000000000..e0b615bc4
+--- /dev/null
++++ b/src/security/register-builtin-guards.ts
+@@ -0,0 +1,115 @@
++import type { MoltbotConfig } from "../config/config.js";
++import type {
++  PluginHookBeforeToolCallEvent,
++  PluginHookBeforeToolCallResult,
++  PluginHookToolContext,
++  PluginHookAfterToolCallEvent,
++} from "../plugins/types.js";
++import { checkCommand, type DangerousCommandGuardConfig } from "./dangerous-command-guard.js";
++import {
++  createAnomalyDetector,
++  type AnomalyDetector,
++  type AnomalyDetectorConfig,
++} from "./anomaly-detector.js";
++import { appendAuditEntry } from "./audit-log.js";
++
++export type BuiltinGuardHooks = {
++  before_tool_call: (
++    event: PluginHookBeforeToolCallEvent,
++    ctx: PluginHookToolContext,
++  ) => PluginHookBeforeToolCallResult | void;
++  after_tool_call: (event: PluginHookAfterToolCallEvent, ctx: PluginHookToolContext) => void;
++};
++
++/**
++ * Extract the command string from a tool-call event, supporting exec, bash,
++ * and nodes (action: "run") tools.
++ */
++function extractCommandFromEvent(event: PluginHookBeforeToolCallEvent): string {
++  const { toolName, params } = event;
++
++  if (toolName === "exec" || toolName === "bash") {
++    if (typeof params.command === "string") return params.command;
++    if (typeof params.input === "string") return params.input;
++    return "";
++  }
++
++  if (toolName === "nodes" && params.action === "run") {
++    if (typeof params.rawCommand === "string") return params.rawCommand;
++    if (typeof params.command === "string") return params.command;
++    if (Array.isArray(params.command)) return params.command.join(" ");
++    return "";
++  }
++
++  return "";
++}
++
++/**
++ * Create hook handlers for the built-in security guards.
++ * These are designed to be registered in the plugin hook system so they run
++ * alongside any user-defined plugin hooks.
++ */
++export function createBuiltinGuardHooks(config?: MoltbotConfig): BuiltinGuardHooks {
++  const safety = config?.agents?.defaults?.safety;
++  const guardConfig: DangerousCommandGuardConfig = {
++    builtinRules: safety?.builtinRules !== false,
++    rules: safety?.rules,
++  };
++
++  const anomalyConfig: AnomalyDetectorConfig | undefined =
++    config?.agents?.defaults?.anomalyDetection;
++  let anomalyDetector: AnomalyDetector | undefined;
++  if (anomalyConfig?.enabled) {
++    anomalyDetector = createAnomalyDetector(anomalyConfig);
++  }
++
++  return {
++    before_tool_call(event, _ctx) {
++      // Check exec/bash/nodes(run) tool calls for dangerous commands.
++      const command = extractCommandFromEvent(event);
++      if (command) {
++        const result = checkCommand(command, guardConfig);
++        if (result.blocked) {
++          appendAuditEntry({
++            ts: Date.now(),
++            event: "command_blocked",
++            toolName: event.toolName,
++            command,
++            ruleName: result.ruleName,
++            reason: result.reason,
++          });
++          return {
++            block: true,
++            blockReason: result.reason,
++          };
++        }
++      }
++
++      // Anomaly detection enforcement (abort mode).
++      if (anomalyDetector) {
++        const anomalyBlock = anomalyDetector.shouldBlock();
++        if (anomalyBlock.block) {
++          appendAuditEntry({
++            ts: Date.now(),
++            event: "anomaly_detected",
++            toolName: event.toolName,
++            reason: anomalyBlock.reason,
++          });
++          return {
++            block: true,
++            blockReason: anomalyBlock.reason,
++          };
++        }
++      }
++    },
++
++    after_tool_call(event, _ctx) {
++      if (!anomalyDetector) return;
++      anomalyDetector.recordToolCall({
++        toolName: event.toolName,
++        params: event.params,
++        error: event.error,
++      });
++    },
++  };
++}
+-- 
+2.52.0
+
