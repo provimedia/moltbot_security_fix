@@ -117,6 +117,57 @@ Session 2: Zähler steht bei $0.00
 
 ---
 
+## Kostenlimits konfigurieren
+
+Mit Fix 6 werden Kosten jetzt persistent gespeichert. Damit das Tracking greift, musst du Limits in deiner Moltbot-Konfiguration hinterlegen.
+
+**Konfiguration per CLI:**
+
+```bash
+moltbot config set agents.defaults.costLimits.perRun 0.50
+moltbot config set agents.defaults.costLimits.perSession 2.00
+moltbot config set agents.defaults.costLimits.perDay 5.00
+moltbot config set agents.defaults.costLimits.action abort
+```
+
+**Oder direkt in der Config-Datei** (`~/.clawdbot/config.yaml`):
+
+```yaml
+agents:
+  defaults:
+    costLimits:
+      perRun: 0.50       # Max USD pro einzelnem Agent-Run
+      perSession: 2.00   # Max USD pro Session (über alle Runs)
+      perDay: 5.00       # Max USD pro Tag (UTC-Datum)
+      action: abort      # "abort" = stoppt den Run, "warn" = nur Warnung
+```
+
+**Felder (alle optional — setze nur was du brauchst):**
+
+| Feld | Typ | Beschreibung |
+|------|-----|--------------|
+| `perRun` | Zahl (USD) | Maximale Kosten pro einzelnem Agent-Run. Wird der Wert überschritten, stoppt der Run. |
+| `perSession` | Zahl (USD) | Maximale Kosten über alle Runs einer Session hinweg. Wird bei neuer Session-ID zurückgesetzt. |
+| `perDay` | Zahl (USD) | Maximale Kosten pro Kalendertag (UTC). Wird um Mitternacht UTC automatisch zurückgesetzt. |
+| `action` | `"abort"` oder `"warn"` | Was passiert wenn ein Limit erreicht wird. Standard: `"abort"` (Run wird gestoppt). |
+
+**Beispiel — nur Tageslimit:**
+
+```yaml
+agents:
+  defaults:
+    costLimits:
+      perDay: 10.00
+```
+
+Der Agent kann pro Tag maximal $10 ausgeben. Danach wird jeder weitere Run abgebrochen bis zum nächsten Tag (UTC Mitternacht).
+
+**Wo werden die Kosten gespeichert?**
+
+Die aktuellen Zähler liegen in `~/.clawdbot/cost-tracking.json`. Diese Datei wird automatisch verwaltet — nicht manuell bearbeiten.
+
+---
+
 ## Installationsanleitung
 
 Wähle die Anleitung die zu deiner Installation passt:
