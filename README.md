@@ -11,11 +11,11 @@ Dieses Paket behebt 6 Sicherheitsprobleme im Moltbot Agent Security Layer.
 **Beispiel:**
 ```
 rm -rf /     # wird erkannt (Leerzeichen danach)
-rm -rf /*    # wird NICHT erkannt — loescht alles!
+rm -rf /*    # wird NICHT erkannt — löscht alles!
 rm -rf /     # wird NICHT erkannt — Zeilenende statt Leerzeichen
 ```
 
-**Loesung:** Das Regex-Pattern prueft jetzt auch auf `/*` und Zeilenende:
+**Lösung:** Das Regex-Pattern prüft jetzt auch auf `/*` und Zeilenende:
 ```
 Vorher:  rm\s+-[rR]f\s+/\s
 Nachher: rm\s+-[rR]f\s+/(?:\s|\*|$)
@@ -25,22 +25,22 @@ Nachher: rm\s+-[rR]f\s+/(?:\s|\*|$)
 
 ### Fix 2 — Regex-Bypasses mit Quotes und Variablen
 
-**Problem:** Ein Angreifer kann gefaehrliche Kommandos durch Shell-Tricks am Guard vorbeischleusen. Quotes, Variablen oder Escape-Sequenzen veraendern den String, sodass das Regex-Pattern nicht mehr greift — die Shell fuehrt den Befehl aber trotzdem aus.
+**Problem:** Ein Angreifer kann gefährliche Kommandos durch Shell-Tricks am Guard vorbeischleusen. Quotes, Variablen oder Escape-Sequenzen verändern den String, sodass das Regex-Pattern nicht mehr greift — die Shell führt den Befehl aber trotzdem aus.
 
 **Beispiel:**
 ```bash
 ord"er"cli --confirm         # Shell entfernt die Quotes → ordercli --confirm
-ordercli$'\x20'--confirm     # ANSI-C Escape fuer Leerzeichen → ordercli --confirm
+ordercli$'\x20'--confirm     # ANSI-C Escape für Leerzeichen → ordercli --confirm
 rm -r${X}f /                 # Leere Variable → rm -rf /
 ```
 
-**Loesung:** Vor der Pruefung wird der Befehl normalisiert — Quotes, Variablen, Backticks und Escape-Sequenzen werden entfernt. Es wird sowohl der Originalbefehl als auch die normalisierte Version geprueft. Wenn eine von beiden matcht, wird geblockt.
+**Lösung:** Vor der Prüfung wird der Befehl normalisiert — Quotes, Variablen, Backticks und Escape-Sequenzen werden entfernt. Es wird sowohl der Originalbefehl als auch die normalisierte Version geprüft. Wenn eine von beiden matcht, wird geblockt.
 
 ---
 
-### Fix 3 — `nodes`-Tool wird nicht geprueft
+### Fix 3 — `nodes`-Tool wird nicht geprüft
 
-**Problem:** Der Guard prueft nur Befehle die ueber `exec` oder `bash` ausgefuehrt werden. Das `nodes`-Tool kann mit `action: "run"` ebenfalls beliebige Shell-Kommandos ausfuehren — ohne jede Pruefung.
+**Problem:** Der Guard prüft nur Befehle die über `exec` oder `bash` ausgeführt werden. Das `nodes`-Tool kann mit `action: "run"` ebenfalls beliebige Shell-Kommandos ausführen — ohne jede Prüfung.
 
 **Beispiel:**
 ```json
@@ -51,16 +51,16 @@ rm -r${X}f /                 # Leere Variable → rm -rf /
     "rawCommand": "ordercli --confirm"
   }
 }
-// → Wird NICHT geprueft, Befehl laeuft durch!
+// → Wird NICHT geprüft, Befehl läuft durch!
 ```
 
-**Loesung:** Der Guard extrahiert jetzt auch Kommandos aus `nodes`-Tool-Aufrufen (bei `action: "run"`) und prueft sie gegen alle Regeln. Andere Actions wie `status` oder `list` sind nicht betroffen.
+**Lösung:** Der Guard extrahiert jetzt auch Kommandos aus `nodes`-Tool-Aufrufen (bei `action: "run"`) und prüft sie gegen alle Regeln. Andere Actions wie `status` oder `list` sind nicht betroffen.
 
 ---
 
 ### Fix 4 — Kein Audit-Trail bei Blocks
 
-**Problem:** Wenn ein gefaehrlicher Befehl geblockt wird, gibt es keinen persistenten Nachweis. Logs gehen beim Neustart verloren. Ein Admin kann nicht nachvollziehen ob und wann Angriffe stattfanden.
+**Problem:** Wenn ein gefährlicher Befehl geblockt wird, gibt es keinen persistenten Nachweis. Logs gehen beim Neustart verloren. Ein Admin kann nicht nachvollziehen ob und wann Angriffe stattfanden.
 
 **Beispiel:**
 ```
@@ -70,7 +70,7 @@ Agent versucht: rm -rf /
 → Nach Gateway-Neustart: keine Spur mehr
 ```
 
-**Loesung:** Jeder Block wird jetzt in `~/.clawdbot/security/audit.jsonl` protokolliert — als append-only JSONL mit Zeitstempel, Tool-Name, Kommando und Regel:
+**Lösung:** Jeder Block wird jetzt in `~/.clawdbot/security/audit.jsonl` protokolliert — als append-only JSONL mit Zeitstempel, Tool-Name, Kommando und Regel:
 ```json
 {"ts":1706620800,"event":"command_blocked","toolName":"bash","command":"rm -rf /","ruleName":"rm-rf-root"}
 ```
@@ -79,7 +79,7 @@ Agent versucht: rm -rf /
 
 ### Fix 5 — Anomaly-Erkennung blockt nicht
 
-**Problem:** Der Anomaly Detector kann auf `action: "abort"` konfiguriert werden, gibt bei erkannten Anomalien aber nur eine Warnung aus. Der Befehl wird trotzdem ausgefuehrt.
+**Problem:** Der Anomaly Detector kann auf `action: "abort"` konfiguriert werden, gibt bei erkannten Anomalien aber nur eine Warnung aus. Der Befehl wird trotzdem ausgeführt.
 
 **Beispiel:**
 ```yaml
@@ -91,10 +91,10 @@ anomalyDetection:
 Agent macht 50 Tool-Calls in einer Minute
 → Anomaly erkannt
 → Log-Meldung: "anomaly detected"
-→ Befehl wird trotzdem ausgefuehrt!  # Bug
+→ Befehl wird trotzdem ausgeführt!  # Bug
 ```
 
-**Loesung:** Bei `action: "abort"` wird jetzt tatsaechlich geblockt. Der Detector hat eine neue `shouldBlock()`-Methode die im Guard abgefragt wird:
+**Lösung:** Bei `action: "abort"` wird jetzt tatsächlich geblockt. Der Detector hat eine neue `shouldBlock()`-Methode die im Guard abgefragt wird:
 - `action: "log"` → nur Debug-Log (wie bisher)
 - `action: "warn"` → Warnung + Audit-Log, kein Block
 - `action: "abort"` → Warnung + Audit-Log + **Block**
@@ -103,29 +103,29 @@ Agent macht 50 Tool-Calls in einer Minute
 
 ### Fix 6 — Kosten-Tracking geht bei Neustart verloren
 
-**Problem:** Session- und Tageskosten werden nur im Arbeitsspeicher gehalten. Bei jedem Gateway-Neustart oder neuer Session starten die Zaehler bei 0. Ein Agent kann sein Tageslimit umgehen indem er den Gateway neu startet.
+**Problem:** Session- und Tageskosten werden nur im Arbeitsspeicher gehalten. Bei jedem Gateway-Neustart oder neuer Session starten die Zähler bei 0. Ein Agent kann sein Tageslimit umgehen indem er den Gateway neu startet.
 
 **Beispiel:**
 ```
 Session 1: $4.50 verbraucht (Limit: $5.00)
 → Gateway-Neustart
-Session 2: Zaehler steht bei $0.00
+Session 2: Zähler steht bei $0.00
 → Agent kann weitere $5.00 ausgeben — Tageslimit ignoriert
 ```
 
-**Loesung:** Session- und Tageskosten werden persistent in `~/.clawdbot/cost-tracking.json` gespeichert. Beim Start werden die letzten Werte geladen. Der Session-Zaehler wird nur bei neuer Session-ID zurueckgesetzt, der Tages-Zaehler nur beim Datumswechsel (UTC).
+**Lösung:** Session- und Tageskosten werden persistent in `~/.clawdbot/cost-tracking.json` gespeichert. Beim Start werden die letzten Werte geladen. Der Session-Zähler wird nur bei neuer Session-ID zurückgesetzt, der Tages-Zähler nur beim Datumswechsel (UTC).
 
 ---
 
 ## Installationsanleitung
 
-Waehle die Anleitung die zu deiner Installation passt:
+Wähle die Anleitung die zu deiner Installation passt:
 
 ---
 
 ### Ich nutze die macOS App (Moltbot.app)
 
-Die macOS App startet einen Gateway-Prozess der JavaScript-Dateien aus einem lokalen Verzeichnis ausfuehrt. Der Fix patcht diese Dateien direkt.
+Die macOS App startet einen Gateway-Prozess der JavaScript-Dateien aus einem lokalen Verzeichnis ausführt. Der Fix patcht diese Dateien direkt.
 
 **Installieren:**
 
@@ -139,7 +139,7 @@ cd moltbot_security_fix
 #    Homebrew: $(brew --prefix)/lib/node_modules/moltbot
 #    git:      ~/moltbot
 
-# 3. Patch ausfuehren (Pfad anpassen!)
+# 3. Patch ausführen (Pfad anpassen!)
 ./patch-dist.sh /usr/local/lib/node_modules/moltbot
 
 # 4. Gateway neu starten
@@ -165,14 +165,14 @@ moltbot gateway restart
 git clone https://github.com/provimedia/moltbot_security_fix.git
 cd moltbot_security_fix
 
-# 2. Patch ausfuehren
+# 2. Patch ausführen
 ./patch-dist.sh /usr/local/lib/node_modules/moltbot
 
 # 3. Gateway neu starten
 moltbot gateway restart
 ```
 
-Falls du nicht weisst wo Moltbot installiert ist:
+Falls du nicht weißt wo Moltbot installiert ist:
 ```bash
 which moltbot
 # oder
@@ -267,7 +267,7 @@ moltbot gateway restart
 systemctl restart moltbot-gateway
 ```
 
-Falls du nicht weisst wo Moltbot installiert ist:
+Falls du nicht weißt wo Moltbot installiert ist:
 ```bash
 which moltbot
 ```
@@ -290,12 +290,12 @@ moltbot gateway restart
 
 ---
 
-### Fuer Maintainer: Sparkle App Update (automatisch an alle Nutzer)
+### Für Maintainer: Sparkle App Update (automatisch an alle Nutzer)
 
 So verteilst du den Fix als offizielles macOS-App-Update:
 
 1. Fix ins Haupt-Repo mergen
-2. Version in `package.json` hochzaehlen
+2. Version in `package.json` hochzählen
 3. App bauen und notarisieren:
    ```bash
    scripts/package-mac-dist.sh
@@ -317,7 +317,7 @@ install.sh                                     # Installiert TypeScript-Quellen
 uninstall.sh                                   # Stellt TypeScript-Originale wieder her
 patch-dist.sh                                  # Patcht kompilierte JS-Dateien
 unpatch-dist.sh                                # Stellt kompilierte JS-Originale wieder her
-security-fix.patch                             # Git-Patch (fuer git apply)
+security-fix.patch                             # Git-Patch (für git apply)
 
 src/                                           # TypeScript-Quellen (11 Dateien)
   security/dangerous-command-guard.ts          #   Fix 1 + 2
@@ -341,7 +341,7 @@ dist/                                          # Kompilierte JS-Dateien (6 Datei
   agents/pi-embedded-runner/run/attempt.js
 ```
 
-## Pruefung / Verifikation
+## Prüfung / Verifikation
 
 Nach der Installation (nur bei Source-Installationen mit `pnpm`):
 
@@ -354,4 +354,4 @@ pnpm vitest run \
   src/infra/cost-tracker.test.ts
 ```
 
-Alle 84 Tests muessen bestehen (0 Failures).
+Alle 84 Tests müssen bestehen (0 Failures).
