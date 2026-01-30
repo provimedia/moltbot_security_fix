@@ -4,14 +4,116 @@ Dieses Paket behebt 6 Sicherheitsprobleme im Moltbot Agent Security Layer.
 
 ## Was wird gefixt?
 
-| # | Problem | Loesung |
-|---|---------|---------|
-| 1 | `rm -rf /*` wird nicht erkannt | Pattern erkennt jetzt auch `/*` und Zeilenende |
-| 2 | Regex-Bypasses mit Quotes/Variablen | Shell-Normalisierung entfernt Tricks vor der Pruefung |
-| 3 | `nodes`-Tool wird nicht geprueft | Kommandos ueber das nodes-Tool werden jetzt auch geblockt |
-| 4 | Kein Audit-Trail bei Blocks | Alle Blocks werden in `~/.clawdbot/security/audit.jsonl` protokolliert |
-| 5 | Anomaly-Erkennung blockt nicht | Bei `action: "abort"` wird jetzt tatsaechlich geblockt |
-| 6 | Kosten-Tracking geht bei Neustart verloren | Session- und Tageskosten werden persistent gespeichert |
+### Fix 1 — `rm -rf /*` wird nicht erkannt
+
+**Problem:** Der Command Guard erkennt `rm -rf /` nur wenn danach ein Leerzeichen folgt. Varianten wie `rm -rf /*` oder `rm -rf /` am Zeilenende werden durchgelassen.
+
+**Beispiel:**
+```
+rm -rf /     # wird erkannt (Leerzeichen danach)
+rm -rf /*    # wird NICHT erkannt — loescht alles!
+rm -rf /     # wird NICHT erkannt — Zeilenende statt Leerzeichen
+```
+
+**Loesung:** Das Regex-Pattern prueft jetzt auch auf `/*` und Zeilenende:
+```
+Vorher:  rm\s+-[rR]f\s+/\s
+Nachher: rm\s+-[rR]f\s+/(?:\s|\*|$)
+```
+
+---
+
+### Fix 2 — Regex-Bypasses mit Quotes und Variablen
+
+**Problem:** Ein Angreifer kann gefaehrliche Kommandos durch Shell-Tricks am Guard vorbeischleusen. Quotes, Variablen oder Escape-Sequenzen veraendern den String, sodass das Regex-Pattern nicht mehr greift — die Shell fuehrt den Befehl aber trotzdem aus.
+
+**Beispiel:**
+```bash
+ord"er"cli --confirm         # Shell entfernt die Quotes → ordercli --confirm
+ordercli$'\x20'--confirm     # ANSI-C Escape fuer Leerzeichen → ordercli --confirm
+rm -r${X}f /                 # Leere Variable → rm -rf /
+```
+
+**Loesung:** Vor der Pruefung wird der Befehl normalisiert — Quotes, Variablen, Backticks und Escape-Sequenzen werden entfernt. Es wird sowohl der Originalbefehl als auch die normalisierte Version geprueft. Wenn eine von beiden matcht, wird geblockt.
+
+---
+
+### Fix 3 — `nodes`-Tool wird nicht geprueft
+
+**Problem:** Der Guard prueft nur Befehle die ueber `exec` oder `bash` ausgefuehrt werden. Das `nodes`-Tool kann mit `action: "run"` ebenfalls beliebige Shell-Kommandos ausfuehren — ohne jede Pruefung.
+
+**Beispiel:**
+```json
+{
+  "toolName": "nodes",
+  "params": {
+    "action": "run",
+    "rawCommand": "ordercli --confirm"
+  }
+}
+// → Wird NICHT geprueft, Befehl laeuft durch!
+```
+
+**Loesung:** Der Guard extrahiert jetzt auch Kommandos aus `nodes`-Tool-Aufrufen (bei `action: "run"`) und prueft sie gegen alle Regeln. Andere Actions wie `status` oder `list` sind nicht betroffen.
+
+---
+
+### Fix 4 — Kein Audit-Trail bei Blocks
+
+**Problem:** Wenn ein gefaehrlicher Befehl geblockt wird, gibt es keinen persistenten Nachweis. Logs gehen beim Neustart verloren. Ein Admin kann nicht nachvollziehen ob und wann Angriffe stattfanden.
+
+**Beispiel:**
+```
+Agent versucht: rm -rf /
+→ Command wird geblockt
+→ Nur eine Konsolenausgabe, kein Logfile
+→ Nach Gateway-Neustart: keine Spur mehr
+```
+
+**Loesung:** Jeder Block wird jetzt in `~/.clawdbot/security/audit.jsonl` protokolliert — als append-only JSONL mit Zeitstempel, Tool-Name, Kommando und Regel:
+```json
+{"ts":1706620800,"event":"command_blocked","toolName":"bash","command":"rm -rf /","ruleName":"rm-rf-root"}
+```
+
+---
+
+### Fix 5 — Anomaly-Erkennung blockt nicht
+
+**Problem:** Der Anomaly Detector kann auf `action: "abort"` konfiguriert werden, gibt bei erkannten Anomalien aber nur eine Warnung aus. Der Befehl wird trotzdem ausgefuehrt.
+
+**Beispiel:**
+```yaml
+anomalyDetection:
+  action: abort              # Soll blocken...
+  maxToolCallsPerMinute: 30
+```
+```
+Agent macht 50 Tool-Calls in einer Minute
+→ Anomaly erkannt
+→ Log-Meldung: "anomaly detected"
+→ Befehl wird trotzdem ausgefuehrt!  # Bug
+```
+
+**Loesung:** Bei `action: "abort"` wird jetzt tatsaechlich geblockt. Der Detector hat eine neue `shouldBlock()`-Methode die im Guard abgefragt wird:
+- `action: "log"` → nur Debug-Log (wie bisher)
+- `action: "warn"` → Warnung + Audit-Log, kein Block
+- `action: "abort"` → Warnung + Audit-Log + **Block**
+
+---
+
+### Fix 6 — Kosten-Tracking geht bei Neustart verloren
+
+**Problem:** Session- und Tageskosten werden nur im Arbeitsspeicher gehalten. Bei jedem Gateway-Neustart oder neuer Session starten die Zaehler bei 0. Ein Agent kann sein Tageslimit umgehen indem er den Gateway neu startet.
+
+**Beispiel:**
+```
+Session 1: $4.50 verbraucht (Limit: $5.00)
+→ Gateway-Neustart
+Session 2: Zaehler steht bei $0.00
+→ Agent kann weitere $5.00 ausgeben — Tageslimit ignoriert
+```
+
+**Loesung:** Session- und Tageskosten werden persistent in `~/.clawdbot/cost-tracking.json` gespeichert. Beim Start werden die letzten Werte geladen. Der Session-Zaehler wird nur bei neuer Session-ID zurueckgesetzt, der Tages-Zaehler nur beim Datumswechsel (UTC).
 
 ---
 
